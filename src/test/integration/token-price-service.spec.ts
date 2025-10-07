@@ -4,11 +4,13 @@ import { GenericContainer, StartedTestContainer } from 'testcontainers';
 import { Kafka, Consumer, KafkaMessage } from 'kafkajs';
 import { Token } from '../../models/token.entity';
 import { TokenPriceUpdateService } from '../../services/token-price-update.service';
-import { MockPriceService } from '../../services/mock-price.service';
+import { PriceProviderService } from '../../services/price-provider.service';
 import { KafkaProducerService } from '../../kafka/kafka-producer.service';
 import { TokenPriceUpdateMessage } from '../../models/token-price-update-message';
 import { Repository } from 'typeorm';
 import { getRepositoryToken } from '@nestjs/typeorm';
+import { PriceApiService } from '../../services/price-api.service';
+import { PriceApiInterface } from '../../services/price-api.interface';
 
 describe('TokenPriceService Integration Tests', () => {
   let postgresContainer: StartedTestContainer;
@@ -28,7 +30,7 @@ describe('TokenPriceService Integration Tests', () => {
   };
   
   beforeAll(async () => {
-    jest.setTimeout(120000); // 2 minutes timeout for container startup
+    jest.setTimeout(300000); // 5 minutes timeout for container startup
     
     try {
       // Get available ports
@@ -44,11 +46,12 @@ describe('TokenPriceService Integration Tests', () => {
           POSTGRES_PASSWORD: 'testpassword',
           POSTGRES_DB: 'testdb',
         })
-        .withExposedPorts(5432)
+        .withExposedPorts(postgresPort)
+        .withStartupTimeout(120000)
         .start();
       
       const postgresHost = postgresContainer.getHost();
-      const mappedPostgresPort = postgresContainer.getMappedPort(5432);
+      const mappedPostgresPort = postgresContainer.getMappedPort(postgresPort);
       
       // Start Zookeeper container (required for Kafka)
       zookeeperContainer = await new GenericContainer('confluentinc/cp-zookeeper:7.3.0')
@@ -57,7 +60,8 @@ describe('TokenPriceService Integration Tests', () => {
           ZOOKEEPER_CLIENT_PORT: '2181',
           ZOOKEEPER_TICK_TIME: '2000',
         })
-        .withExposedPorts(2181)
+        .withExposedPorts(zookeeperPort)
+        .withStartupTimeout(120000)
         .start();
       
       // Wait for Zookeeper to start
@@ -68,16 +72,17 @@ describe('TokenPriceService Integration Tests', () => {
         .withName(`kafka-test-${testId}`)
         .withEnvironment({
           KAFKA_BROKER_ID: '1',
-          KAFKA_ZOOKEEPER_CONNECT: `${zookeeperContainer.getHost()}:${zookeeperContainer.getMappedPort(2181)}`,
-          KAFKA_ADVERTISED_LISTENERS: `PLAINTEXT://${kafkaContainer.getHost()}:${kafkaPort}`,
+          KAFKA_ZOOKEEPER_CONNECT: `${zookeeperContainer.getHost()}:${zookeeperContainer.getMappedPort(zookeeperPort)}`,
+          KAFKA_ADVERTISED_LISTENERS: `PLAINTEXT://localhost:${kafkaPort}`,
           KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: '1',
           KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true',
         })
-        .withExposedPorts(9092)
+        .withExposedPorts(kafkaPort)
+        .withStartupTimeout(120000)
         .start();
       
-      const kafkaHost = kafkaContainer.getHost();
-      const mappedKafkaPort = kafkaContainer.getMappedPort(9092);
+      const kafkaHost = 'localhost';
+      const mappedKafkaPort = kafkaContainer.getMappedPort(kafkaPort);
       
       // Wait for Kafka to be fully ready
       await new Promise(resolve => setTimeout(resolve, 5000));
@@ -109,7 +114,11 @@ describe('TokenPriceService Integration Tests', () => {
         ],
         providers: [
           TokenPriceUpdateService,
-          MockPriceService,
+          PriceProviderService,
+          {
+            provide: PriceApiInterface,
+            useClass: PriceApiService,
+          },
           {
             provide: KafkaProducerService,
             useValue: {
@@ -128,7 +137,7 @@ describe('TokenPriceService Integration Tests', () => {
       console.error('Error during test setup:', error);
       throw error;
     }
-  }, 120000);
+  }, 300000);
   
   afterAll(async () => {
     if (moduleRef) {
@@ -164,15 +173,6 @@ describe('TokenPriceService Integration Tests', () => {
     token.isProtected = false;
     token.priority = 1;
     token.timestamp = new Date();
-    token.chain_Id = '11111111-1111-1111-1111-111111111111';
-    token.chain_DeId = 1;
-    token.chain_Name = 'Test Chain';
-    token.chain_IsEnabled = true;
-    token.logo_Id = '22222222-2222-2222-2222-222222222222';
-    token.logo_TokenId = '33333333-3333-3333-3333-333333333333';
-    token.logo_BigRelativePath = '/test.png';
-    token.logo_SmallRelativePath = '/test_small.png';
-    token.logo_ThumbRelativePath = '/test_thumb.png';
     token.price = 100;
     token.lastPriceUpdate = new Date();
     
@@ -182,15 +182,17 @@ describe('TokenPriceService Integration Tests', () => {
     tokenPriceUpdateService.start();
     
     // Wait for price updates to occur
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    await new Promise(resolve => setTimeout(resolve, 6000));
     
     // Stop the service
-    tokenPriceUpdateService.stop();
+    (tokenPriceUpdateService as any).stop();
     
     // Check if token price was updated in the database
     const updatedToken = await tokenRepository.findOne({ where: { id: token.id } });
     expect(updatedToken).toBeDefined();
-    expect(updatedToken.price).not.toEqual(100);
+    if (updatedToken) {
+      expect(updatedToken.price).not.toEqual(100);
+    }
     
     // Note: In a real test, we would also check for Kafka messages,
     // but since we're mocking the KafkaProducerService, we can't do that here

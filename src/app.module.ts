@@ -1,37 +1,69 @@
 import { Module, OnModuleInit } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { Token } from './models/token.entity';
 import { TokenPriceUpdateService } from './services/token-price-update.service';
-import { MockPriceService } from './services/mock-price.service';
+import { PriceProviderService } from './services/price-provider.service';
 import { KafkaProducerService } from './kafka/kafka-producer.service';
 import { TokenSeeder } from './data/token.seeder';
+import { PriceApiService } from './services/price-api.service';
+import { PriceApiInterface } from './services/price-api.interface';
+
+function validate(config: Record<string, any>) {
+  const requiredKeys = [
+    'DB_HOST',
+    'DB_PORT',
+    'DB_USERNAME',
+    'DB_PASSWORD',
+    'DB_NAME',
+    'KAFKA_CLIENT_ID',
+    'KAFKA_BROKERS',
+    'API_URL',
+  ];
+
+  for (const key of requiredKeys) {
+    if (!config[key]) {
+      throw new Error(`Missing required environment variable: ${key}`);
+    }
+  }
+  return config;
+}
 
 @Module({
   imports: [
     ConfigModule.forRoot({
-      isGlobal: true,
+      isGlobal: true, // Make environment variables globally available
+      envFilePath: '.env', // Load variables from .env file
+      validate,
     }),
-    TypeOrmModule.forRoot({
-      type: 'postgres',
-      host: 'localhost',
-      port: 5432,
-      username: 'postgres',
-      password: 'postgres',
-      database: 'tokens',
-      entities: [Token],
-      migrations: [__dirname + '/migrations/*.{js,ts}'],
-      migrationsRun: true, // Run migrations automatically
-      synchronize: false, // Disabled when using migrations
+    TypeOrmModule.forRootAsync({
+      imports: [ConfigModule],
+      useFactory: (configService: ConfigService) => ({
+        type: 'postgres',
+        host: configService.get<string>('DB_HOST'),
+        port: configService.get<number>('DB_PORT'),
+        username: configService.get<string>('DB_USERNAME'),
+        password: configService.get<string>('DB_PASSWORD'),
+        database: configService.get<string>('DB_NAME'),
+        entities: [Token],
+        migrations: [__dirname + '/migrations/*.{js,ts}'],
+        migrationsRun: false, // Disable automatic migrations
+        synchronize: false, // Ensure schema synchronization is disabled
+      }),
+      inject: [ConfigService],
     }),
     TypeOrmModule.forFeature([Token]),
   ],
   controllers: [],
   providers: [
     TokenPriceUpdateService,
-    MockPriceService,
+    PriceProviderService,
     KafkaProducerService,
     TokenSeeder,
+    {
+      provide: PriceApiInterface,
+      useClass: PriceApiService,
+    },
   ],
 })
 export class AppModule implements OnModuleInit {
@@ -41,14 +73,10 @@ export class AppModule implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
-    try {
-      // Seed initial data
-      await this.tokenSeeder.seed();
-      
-      // Start price update service
-      this.tokenPriceUpdateService.start();
-    } catch (error) {
-      console.error('Failed to initialize application:', error);
-    }
+    // Seed initial data
+    await this.tokenSeeder.seed();
+    
+    // Start price update service
+    this.tokenPriceUpdateService.start();
   }
 }

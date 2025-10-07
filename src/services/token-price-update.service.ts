@@ -2,7 +2,7 @@ import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Token } from '../models/token.entity';
-import { MockPriceService } from './mock-price.service';
+import { PriceProviderService } from './price-provider.service';
 import { KafkaProducerService } from '../kafka/kafka-producer.service';
 import { createTokenPriceUpdateMessage } from '../models/token-price-update-message';
 
@@ -16,7 +16,7 @@ export class TokenPriceUpdateService implements OnModuleDestroy {
   constructor(
     @InjectRepository(Token)
     private readonly tokenRepository: Repository<Token>,
-    private readonly priceService: MockPriceService,
+    private readonly priceService: PriceProviderService,
     private readonly kafkaProducer: KafkaProducerService,
   ) {}
 
@@ -28,20 +28,21 @@ export class TokenPriceUpdateService implements OnModuleDestroy {
 
     this.isRunning = true;
     this.logger.log(`Starting price update service (interval: ${this.updateIntervalSeconds} seconds)...`);
-        
-    this.timer = setInterval(      
-      async () => {
-        try {
-          await this.updatePrices();
-        } catch (error) {
-          this.logger.error(`Error in price update interval: ${error.message}`);
+    
+    const runUpdate = async () => {
+      try {
+        await this.updatePrices();
+      } catch (error) {
+        this.logger.error(`Error in price update interval: ${error.message}`);
+      } finally {
+        if (this.isRunning) {
+          this.timer = setTimeout(runUpdate, this.updateIntervalSeconds * 1000);
         }
-      },
-      this.updateIntervalSeconds * 1000,
-    );
+      }
+    };
 
     // Trigger an initial update immediately
-    this.updatePrices().catch(error => {
+    runUpdate().catch(error => {
       this.logger.error(`Error in initial price update: ${error.message}`);
     });
   }
@@ -51,9 +52,8 @@ export class TokenPriceUpdateService implements OnModuleDestroy {
       const tokens = await this.tokenRepository.find();
       this.logger.log(`Updating prices for ${tokens.length} tokens...`);
       
-      for (const token of tokens) {
-        await this.updateTokenPrice(token);
-      }
+      await Promise.all(tokens.map(token => this.updateTokenPrice(token)));
+
     } catch (error) {
       this.logger.error(`Error updating prices: ${error.message}`);      
     }
@@ -62,9 +62,9 @@ export class TokenPriceUpdateService implements OnModuleDestroy {
   private async updateTokenPrice(token: Token): Promise<void> {
     try {
       const oldPrice = token.price;
-      const newPrice = await this.priceService.getRandomPriceForToken(token);
+      const newPrice = await this.priceService.getPriceForToken(token);
       
-      if (oldPrice !== newPrice) {
+      if (newPrice !== null && oldPrice !== newPrice) {
         // Create message for Kafka using Zod helper function
         const message = createTokenPriceUpdateMessage({
           tokenId: token.id,
@@ -88,13 +88,13 @@ export class TokenPriceUpdateService implements OnModuleDestroy {
     }
   }
 
-  stop(): void {
+  private stop(): void {
     if (!this.isRunning) {
       this.logger.warn('Price update service is not running');
       return;
     }
 
-    clearInterval(this.timer);
+    clearTimeout(this.timer);
     this.isRunning = false;
     this.logger.log('Price update service stopped');
   }
